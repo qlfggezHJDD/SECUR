@@ -44,15 +44,21 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    # Write to a temp file then atomically swap it in, so a crash or a
+    # full disk mid-write can never leave a half-written config.json.
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_PATH)
 
 
 # Intents required:
 # - members: to see joins/leaves and role/timeout changes
 # - guilds: channel/role create/delete events
 # - moderation: ban/unban events
-# - message_content: required for prefix commands (!an_..., +s ...) to
+# - message_content: required for prefix commands (!s ..., +s ...) to
 #   read their arguments (user mentions, reasons, channel mentions, etc.)
 # NOTE: "members" and "message_content" are both privileged intents —
 # enable "Server Members Intent" AND "Message Content Intent" for this bot
@@ -65,11 +71,11 @@ intents.moderation = True
 intents.message_content = True
 
 bot = commands.Bot(
-    # "!" for the owner-only an_* config commands, "+s " for the
-    # special-role moderation commands (ban/kick/mute/etc — see
-    # cogs/anti_nuke.py). A command's actual access check (owner vs. the
-    # special role) is enforced per-command, not by which prefix was used.
-    command_prefix=commands.when_mentioned_or("!", "+s "),
+    # "!s <commande>" (or "+s <commande>") for every command. A command's
+    # access check (owner for config commands, special role for
+    # ban/kick/mute/etc — see cogs/anti_nuke.py) is enforced per-command,
+    # not by which prefix was used.
+    command_prefix=commands.when_mentioned_or("!s ", "+s "),
     intents=intents,
     help_command=None,
 )
