@@ -15,7 +15,9 @@ action it takes is logged.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
+import re
 import time
 from collections import defaultdict
 from typing import Optional
@@ -26,6 +28,162 @@ from discord.ext import commands
 log = logging.getLogger("anti_nuke.cog")
 
 UTC = datetime.timezone.utc
+
+# --------------------------------------------------------------------- #
+# Every setting of config.json that can be edited from Discord.
+# `!s set <key> <value>` handles SCALAR_SETTINGS (dotted keys address
+# the nested "punishment" / "thresholds" sections), `!s add`,
+# `!s remove` and `!s clear` handle LIST_SETTINGS.
+# --------------------------------------------------------------------- #
+
+ACTION_KEYS = (
+    "kicks",
+    "bans",
+    "mutes",
+    "dangerous_role_grants",
+    "channel_deletes",
+    "channel_creates",
+    "role_deletes",
+    "role_creates",
+    "bot_adds",
+    "webhook_creates",
+)
+
+SCALAR_SETTINGS: dict[str, tuple] = {
+    "log_channel_id": ("channel",),
+    "trap_channel_id": ("channel",),
+    "alert_ping_user_id": ("user",),
+    "special_staff_role_id": ("role",),
+    "new_account_min_age_days": ("int", 0, 3650),
+    "new_account_action": ("choice", ("flag", "kick", "ban")),
+    "punishment.strip_roles": ("bool",),
+    "punishment.timeout_minutes": ("int", 0, 40320),  # Discord max = 28 days
+    "punishment.ban_on_severe": ("bool",),
+    "thresholds.window_seconds": ("int", 1, 3600),
+    **{f"thresholds.{k}": ("int", 0, 1000) for k in ACTION_KEYS},
+}
+
+LIST_SETTINGS: dict[str, str] = {
+    "owner_ids": "user",
+    "whitelisted_users": "user",
+    "whitelisted_roles": "role",
+    "dangerous_permissions": "permission",
+    "severe_actions": "action",
+}
+
+VALID_PERMISSIONS = frozenset(name for name, _ in discord.Permissions.none())
+
+_TRUE = {"true", "on", "yes", "y", "1", "oui", "vrai"}
+_FALSE = {"false", "off", "no", "n", "0", "non", "faux"}
+_OFF = {"none", "off", "disable", "disabled", "null"}
+_ID_RE = re.compile(r"<(?:@[!&]?|#)(\d+)>|(\d+)")
+
+
+CONFIG_COMMANDS = frozenset({
+    "status", "help", "set", "add", "remove", "clear", "reload",
+    "whitelist_user", "unwhitelist_user", "whitelist_role", "unwhitelist_role",
+    "set_log_channel", "set_trap_channel",
+})
+
+
+def parse_id(raw: str) -> int:
+    m = _ID_RE.fullmatch(raw.strip())
+    if not m:
+        raise ValueError(f"`{raw}` is not a valid ID or mention.")
+    return int(m.group(1) or m.group(2))
+
+
+def parse_item(
+    kind: str,
+    raw: str,
+    guild: Optional[discord.Guild] = None,
+    allow_zero: bool = False,
+):
+    """Parse + validate one value. When `guild` is None, only the syntax is
+    checked (used for removals, so stale/deleted IDs can still be removed)."""
+    raw = raw.strip()
+    if kind == "permission":
+        name = raw.lower()
+        if name not in VALID_PERMISSIONS:
+            raise ValueError(f"`{raw}` is not a Discord permission name (e.g. `ban_members`).")
+        return name
+    if kind == "action":
+        name = raw.lower()
+        if name not in ACTION_KEYS:
+            raise ValueError(f"`{raw}` is not a watched action. Valid: {', '.join(ACTION_KEYS)}.")
+        return name
+
+    id_ = parse_id(raw)
+    if id_ == 0:
+        if allow_zero:
+            return 0
+        raise ValueError("0 is not a valid ID here.")
+    if guild is None:
+        return id_
+    if kind == "channel" and not isinstance(guild.get_channel(id_), discord.TextChannel):
+        raise ValueError(f"`{raw}` is not a text channel of this server.")
+    if kind == "role":
+        if id_ == guild.id:
+            raise ValueError("@everyone cannot be used here.")
+        if guild.get_role(id_) is None:
+            raise ValueError(f"`{raw}` is not a role of this server.")
+    return id_
+
+
+def parse_scalar(spec: tuple, raw: str, guild: discord.Guild):
+    kind = spec[0]
+    raw = raw.strip()
+    if kind in ("channel", "role", "user"):
+        if raw.lower() in _OFF:
+            raw = "0"
+        return parse_item(kind, raw, guild, allow_zero=True)
+    if kind == "int":
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"`{raw}` is not a whole number.") from None
+        lo, hi = spec[1], spec[2]
+        if not lo <= value <= hi:
+            raise ValueError(f"Value must be between {lo} and {hi}.")
+        return value
+    if kind == "bool":
+        low = raw.lower()
+        if low in _TRUE:
+            return True
+        if low in _FALSE:
+            return False
+        raise ValueError("Use `true` or `false` (also: on/off, yes/no, oui/non).")
+    if kind == "choice":
+        low = raw.lower()
+        if low not in spec[1]:
+            raise ValueError(f"Must be one of: {', '.join(spec[1])}.")
+        return low
+    raise ValueError(f"Unsupported setting type {kind!r}.")
+
+
+def fmt_ref(kind: str, value) -> str:
+    if kind == "channel":
+        return f"<#{value}>"
+    if kind == "role":
+        return f"<@&{value}>"
+    if kind == "user":
+        return f"<@{value}>"
+    return f"`{value}`"
+
+
+def config_admin():
+    """Command check for every an_* command: server owner or config.json
+    `owner_ids` only."""
+
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage()
+        return (
+            ctx.author.id == ctx.guild.owner_id
+            or ctx.author.id in ctx.bot.config.get("owner_ids", [])
+        )
+
+    return commands.check(predicate)
 
 
 def has_special_role():
@@ -456,79 +614,320 @@ class AntiNuke(commands.Cog):
         )
 
     # ------------------------------------------------------------------ #
-    # Management commands (owner / server owner only)
+    # Management commands (server owner / owner_ids only)
+    #
+    # Everything in config.json can be changed from Discord:
+    #   !s status                         show the whole config
+    #   !s set <key> <value>              change any single setting
+    #   !s add / !s remove <list> <...>  edit a list (whitelist, owners...)
+    #   !s clear <list>                   empty a list
+    #   !s reload                         re-read config.json from disk
+    #   !s help                           list every key
     # ------------------------------------------------------------------ #
 
     def _is_authorized(self, ctx: commands.Context) -> bool:
         return (
-            ctx.author.id == ctx.guild.owner_id
-            or ctx.author.id in self.cfg.get("owner_ids", [])
+            ctx.guild is not None
+            and (
+                ctx.author.id == ctx.guild.owner_id
+                or ctx.author.id in self.cfg.get("owner_ids", [])
+            )
         )
 
-    @commands.command(name="an_whitelist_user")
+    async def _say(self, ctx: commands.Context, text: str):
+        # Replies may contain <@id> mentions: never actually ping anyone.
+        return await ctx.reply(text, allowed_mentions=discord.AllowedMentions.none())
+
+    async def _say_cv2(self, ctx: commands.Context, title: str, description: str, color: int):
+        view = self.build_cv2(title, description, color)
+        return await ctx.reply(view=view, allowed_mentions=discord.AllowedMentions.none())
+
+    def _get(self, key: str):
+        section, _, name = key.partition(".")
+        if name:
+            return self.cfg.get(section, {}).get(name)
+        return self.cfg.get(key)
+
+    def _put(self, key: str, value) -> None:
+        section, _, name = key.partition(".")
+        if name:
+            self.cfg.setdefault(section, {})[name] = value
+        else:
+            self.cfg[key] = value
+
+    def _save(self) -> str:
+        """Persist config.json. Returns a suffix to append to the reply."""
+        try:
+            self.bot.save_config()
+            return ""
+        except OSError as exc:
+            log.exception("Could not write config.json")
+            return f"\n⚠️ Applied in memory but could NOT be saved to config.json ({exc})."
+
+    def _fmt_scalar(self, key: str) -> str:
+        spec = SCALAR_SETTINGS[key]
+        value = self._get(key)
+        if value is None:
+            return "—"
+        kind = spec[0]
+        if kind in ("channel", "role", "user"):
+            return fmt_ref(kind, value) if value else "not set"
+        if kind == "bool":
+            return "on" if value else "off"
+        return f"`{value}`"
+
+    def _config_chunks(self) -> list[str]:
+        groups: dict[str, list[str]] = {"General": [], "Punishment": [], "Thresholds": []}
+        for key in SCALAR_SETTINGS:
+            if key.startswith("punishment."):
+                group = "Punishment"
+            elif key.startswith("thresholds."):
+                group = "Thresholds"
+            else:
+                group = "General"
+            groups[group].append(f"`{key}`: {self._fmt_scalar(key)}")
+
+        blocks = [f"**{name}**\n" + "\n".join(lines) for name, lines in groups.items()]
+        for key, kind in LIST_SETTINGS.items():
+            values = self.cfg.get(key, [])
+            shown = ", ".join(fmt_ref(kind, v) for v in values[:15]) or "none"
+            if len(values) > 15:
+                shown += f" … (+{len(values) - 15} more)"
+            blocks.append(f"**{key}** ({len(values)})\n{shown}")
+
+        # Components V2 caps the text per message, so split into chunks.
+        chunks: list[str] = []
+        current = ""
+        for block in blocks:
+            if current and len(current) + len(block) + 2 > 3000:
+                chunks.append(current)
+                current = block
+            else:
+                current = f"{current}\n\n{block}" if current else block
+        chunks.append(current)
+        return chunks
+
+    async def cog_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        cmd = ctx.command
+        if cmd is None or cmd.name not in CONFIG_COMMANDS:
+            return  # +s commands have their own handler
+        if isinstance(error, commands.NoPrivateMessage):
+            return await self._say(ctx, "This command only works inside a server.")
+        if isinstance(error, commands.CheckFailure):
+            return await self._say(ctx, "You are not authorized to change anti-nuke settings.")
+        if isinstance(
+            error,
+            (commands.MissingRequiredArgument, commands.BadArgument, commands.TooManyArguments),
+        ):
+            return await self._say(
+                ctx, f"❌ {error}\nUsage: `!s {cmd.qualified_name} {cmd.signature}`".strip()
+            )
+        log.exception("Unhandled error in %s", cmd.name, exc_info=error)
+        await self._say(ctx, "❌ Unexpected error — check the console.")
+
+    # ---- read ---------------------------------------------------------- #
+
+    @commands.command(name="status", aliases=["config"])
+    @config_admin()
+    async def status(self, ctx: commands.Context):
+        """Show the whole configuration."""
+        chunks = self._config_chunks()
+        for i, text in enumerate(chunks, 1):
+            title = "Anti-Nuke config" + (f" ({i}/{len(chunks)})" if len(chunks) > 1 else "")
+            await self._say_cv2(ctx, title, text, 0x2ECC71)
+
+    @commands.command(name="help")
+    @config_admin()
+    async def an_help(self, ctx: commands.Context):
+        """List every command and every editable key."""
+        text = (
+            "`!s status` — show the whole config\n"
+            "`!s set <key> <value>` — change one setting (`0` or `off` disables an ID setting)\n"
+            "`!s add <list> <value...>` — add to a list\n"
+            "`!s remove <list> <value...>` — remove from a list\n"
+            "`!s clear <list>` — empty a list\n"
+            "`!s reload` — re-read config.json from disk\n"
+            "Shortcuts: `!s whitelist_user`, `!s unwhitelist_user`, `!s whitelist_role`, "
+            "`!s unwhitelist_role`, `!s set_log_channel`, `!s set_trap_channel`\n\n"
+            f"**Keys for `!s set`**\n{', '.join(f'`{k}`' for k in SCALAR_SETTINGS)}\n\n"
+            f"**Lists for `!s add` / `!s remove` / `!s clear`**\n"
+            f"{', '.join(f'`{k}`' for k in LIST_SETTINGS)}"
+        )
+        await self._say_cv2(ctx, "Anti-Nuke commands", text, 0x3498DB)
+
+    # ---- write: scalars ------------------------------------------------ #
+
+    @commands.command(name="set")
+    @config_admin()
+    async def an_set(self, ctx: commands.Context, key: str, *, value: str):
+        """Change any single setting: !s set <key> <value>"""
+        key = key.lower()
+        if key in LIST_SETTINGS:
+            return await self._say(ctx, f"`{key}` is a list — use `!s add` / `!s remove` / `!s clear`.")
+        spec = SCALAR_SETTINGS.get(key)
+        if spec is None:
+            return await self._say(
+                ctx, f"❌ Unknown key `{key}`. Use `!s help` to see every key."
+            )
+        try:
+            new = parse_scalar(spec, value, ctx.guild)
+        except ValueError as exc:
+            return await self._say(ctx, f"❌ {exc}")
+
+        old = self._fmt_scalar(key)
+        self._put(key, new)
+        suffix = self._save()
+        await self._say(ctx, f"✅ `{key}`: {old} → {self._fmt_scalar(key)}{suffix}")
+
+    # ---- write: lists -------------------------------------------------- #
+
+    @commands.command(name="add")
+    @config_admin()
+    async def an_add(self, ctx: commands.Context, key: str, *values: str):
+        """Add one or several values to a list: !s add <list> <value...>"""
+        key = key.lower()
+        kind = LIST_SETTINGS.get(key)
+        if kind is None or not values:
+            return await self._say(
+                ctx,
+                f"Usage: `!s add <list> <value...>` — lists: {', '.join(f'`{k}`' for k in LIST_SETTINGS)}",
+            )
+        current = self.cfg.setdefault(key, [])
+        added, skipped, errors = [], [], []
+        for raw in values:
+            try:
+                item = parse_item(kind, raw, ctx.guild)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            if item in current:
+                skipped.append(fmt_ref(kind, item))
+            else:
+                current.append(item)
+                added.append(fmt_ref(kind, item))
+
+        parts = []
+        if added:
+            parts.append(f"✅ Added to `{key}`: {', '.join(added)}" + self._save())
+        if skipped:
+            parts.append(f"ℹ️ Already present: {', '.join(skipped)}")
+        parts.extend(f"❌ {e}" for e in errors)
+        await self._say(ctx, "\n".join(parts))
+
+    @commands.command(name="remove")
+    @config_admin()
+    async def an_remove(self, ctx: commands.Context, key: str, *values: str):
+        """Remove one or several values from a list: !s remove <list> <value...>"""
+        key = key.lower()
+        kind = LIST_SETTINGS.get(key)
+        if kind is None or not values:
+            return await self._say(
+                ctx,
+                f"Usage: `!s remove <list> <value...>` — lists: {', '.join(f'`{k}`' for k in LIST_SETTINGS)}",
+            )
+        current = self.cfg.setdefault(key, [])
+        removed, missing, errors = [], [], []
+        for raw in values:
+            try:
+                item = parse_item(kind, raw)  # syntax only: stale IDs can be removed
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            if item in current:
+                current.remove(item)
+                removed.append(fmt_ref(kind, item))
+            else:
+                missing.append(fmt_ref(kind, item))
+
+        parts = []
+        if removed:
+            parts.append(f"✅ Removed from `{key}`: {', '.join(removed)}" + self._save())
+        if missing:
+            parts.append(f"ℹ️ Not in the list: {', '.join(missing)}")
+        parts.extend(f"❌ {e}" for e in errors)
+        await self._say(ctx, "\n".join(parts))
+
+    @commands.command(name="clear")
+    @config_admin()
+    async def an_clear(self, ctx: commands.Context, key: str):
+        """Empty a list: !s clear <list>"""
+        key = key.lower()
+        if key not in LIST_SETTINGS:
+            return await self._say(
+                ctx, f"Usage: `!s clear <list>` — lists: {', '.join(f'`{k}`' for k in LIST_SETTINGS)}"
+            )
+        count = len(self.cfg.get(key, []))
+        self.cfg[key] = []
+        await self._say(ctx, f"✅ `{key}` cleared ({count} entr{'y' if count == 1 else 'ies'} removed).{self._save()}")
+
+    # ---- reload -------------------------------------------------------- #
+
+    @commands.command(name="reload")
+    @config_admin()
+    async def an_reload(self, ctx: commands.Context):
+        """Re-read config.json from disk (after editing the file by hand)."""
+        try:
+            with open(self.bot.config_path, "r", encoding="utf-8") as f:
+                fresh = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            return await self._say(ctx, f"❌ Could not reload config.json: {exc}")
+        self.bot.config.clear()
+        self.bot.config.update(fresh)
+        await self._say(ctx, "✅ config.json reloaded from disk.")
+
+    # ---- shortcuts (kept for backwards compatibility) ------------------ #
+
+    @commands.command(name="whitelist_user")
+    @config_admin()
     async def whitelist_user(self, ctx: commands.Context, user: discord.Member):
-        if not self._is_authorized(ctx):
-            return await ctx.reply("You are not authorized to change anti-nuke settings.")
         wl = self.cfg.setdefault("whitelisted_users", [])
         if user.id not in wl:
             wl.append(user.id)
-            self.bot.save_config()
-        await ctx.reply(f"✅ {user} added to the anti-nuke whitelist.")
+        await self._say(ctx, f"✅ {user} added to the anti-nuke whitelist.{self._save()}")
 
-    @commands.command(name="an_unwhitelist_user")
+    @commands.command(name="unwhitelist_user")
+    @config_admin()
     async def unwhitelist_user(self, ctx: commands.Context, user: discord.Member):
-        if not self._is_authorized(ctx):
-            return await ctx.reply("You are not authorized to change anti-nuke settings.")
         wl = self.cfg.setdefault("whitelisted_users", [])
         if user.id in wl:
             wl.remove(user.id)
-            self.bot.save_config()
-        await ctx.reply(f"✅ {user} removed from the anti-nuke whitelist.")
+        await self._say(ctx, f"✅ {user} removed from the anti-nuke whitelist.{self._save()}")
 
-    @commands.command(name="an_whitelist_role")
+    @commands.command(name="whitelist_role")
+    @config_admin()
     async def whitelist_role(self, ctx: commands.Context, role: discord.Role):
-        if not self._is_authorized(ctx):
-            return await ctx.reply("You are not authorized to change anti-nuke settings.")
+        if role.id == ctx.guild.id:
+            return await self._say(ctx, "❌ @everyone cannot be whitelisted — that would disable the protection.")
         wl = self.cfg.setdefault("whitelisted_roles", [])
         if role.id not in wl:
             wl.append(role.id)
-            self.bot.save_config()
-        await ctx.reply(f"✅ Role {role.name} added to the anti-nuke whitelist.")
+        await self._say(ctx, f"✅ Role {role.name} added to the anti-nuke whitelist.{self._save()}")
 
-    @commands.command(name="an_set_log_channel")
+    @commands.command(name="unwhitelist_role")
+    @config_admin()
+    async def unwhitelist_role(self, ctx: commands.Context, role: discord.Role):
+        wl = self.cfg.setdefault("whitelisted_roles", [])
+        if role.id in wl:
+            wl.remove(role.id)
+        await self._say(ctx, f"✅ Role {role.name} removed from the anti-nuke whitelist.{self._save()}")
+
+    @commands.command(name="set_log_channel")
+    @config_admin()
     async def set_log_channel(self, ctx: commands.Context, channel: discord.TextChannel):
-        if not self._is_authorized(ctx):
-            return await ctx.reply("You are not authorized to change anti-nuke settings.")
         self.cfg["log_channel_id"] = channel.id
-        self.bot.save_config()
-        await ctx.reply(f"✅ Log channel set to {channel.mention}.")
+        await self._say(ctx, f"✅ Log channel set to {channel.mention}.{self._save()}")
 
-    @commands.command(name="an_set_trap_channel")
+    @commands.command(name="set_trap_channel")
+    @config_admin()
     async def set_trap_channel(self, ctx: commands.Context, channel: discord.TextChannel):
-        if not self._is_authorized(ctx):
-            return await ctx.reply("You are not authorized to change anti-nuke settings.")
         self.cfg["trap_channel_id"] = channel.id
-        self.bot.save_config()
-        await ctx.reply(
+        await self._say(
+            ctx,
             f"🪤 Trap channel set to {channel.mention} — anyone who posts there now gets "
             "banned instantly. Make sure it's hidden from everyone except "
             "@everyone/scam-bait visibility, and that none of your real mods/admins "
-            "would ever post in it (whitelisted users are exempt)."
+            f"would ever post in it (whitelisted users are exempt).{self._save()}",
         )
-
-    @commands.command(name="an_status")
-    async def status(self, ctx: commands.Context):
-        t = self.cfg["thresholds"]
-        lines = [f"**{k}**: {v}" for k, v in t.items()]
-        trap_id = self.cfg.get("trap_channel_id")
-        lines.append("")
-        lines.append(f"**Whitelisted users**: {len(self.cfg.get('whitelisted_users', []))}")
-        lines.append(f"**Whitelisted roles**: {len(self.cfg.get('whitelisted_roles', []))}")
-        lines.append(f"**Trap channel**: {f'<#{trap_id}>' if trap_id else 'not set'}")
-        role_id = self.cfg.get("special_staff_role_id")
-        lines.append(f"**+s staff role**: {f'<@&{role_id}>' if role_id else 'not set'}")
-        view = self.build_cv2("Anti-Nuke status", "\n".join(lines), 0x2ECC71)
-        await ctx.reply(view=view)
 
 
     # ------------------------------------------------------------------ #
