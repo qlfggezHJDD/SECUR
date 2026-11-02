@@ -28,6 +28,23 @@ log = logging.getLogger("anti_nuke.cog")
 UTC = datetime.timezone.utc
 
 
+def has_special_role():
+    """Command check: only members with the configured special staff role
+    (bot.config['special_staff_role_id']) can run the command. Used for the
+    +s moderation commands — unlike the an_* config commands, there's no
+    owner/server-owner fallback here, it's role-only by design."""
+
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.guild is None or not isinstance(ctx.author, discord.Member):
+            return False
+        role_id = ctx.bot.config.get("special_staff_role_id")
+        if not role_id:
+            return False
+        return any(r.id == role_id for r in ctx.author.roles)
+
+    return commands.check(predicate)
+
+
 class AntiNuke(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -76,15 +93,49 @@ class AntiNuke(commands.Cog):
             return chan
         return None
 
-    async def alert(self, guild: discord.Guild, title: str, description: str, color: int = 0xE74C3C):
+    def build_cv2(
+        self,
+        title: str,
+        description: str,
+        color: int,
+        mention_id: Optional[int] = None,
+    ) -> discord.ui.LayoutView:
+        """Build a Components V2 message (the modern replacement for
+        discord.Embed) — a LayoutView holding a Container with an accent
+        colour, a heading, a body and a live Discord timestamp. Used for
+        every message the bot sends (alerts, command replies)."""
+        view = discord.ui.LayoutView()
+        container = discord.ui.Container(accent_color=discord.Color(color))
+        if mention_id:
+            container.add_item(discord.ui.TextDisplay(f"<@{mention_id}>"))
+        container.add_item(discord.ui.TextDisplay(f"# {title}"))
+        container.add_item(discord.ui.TextDisplay(description or "\u200b"))
+        container.add_item(discord.ui.Separator())
+        ts = int(datetime.datetime.now(UTC).timestamp())
+        container.add_item(discord.ui.TextDisplay(f"<t:{ts}:f>"))
+        view.add_item(container)
+        return view
+
+    async def alert(
+        self,
+        guild: discord.Guild,
+        title: str,
+        description: str,
+        color: int = 0xE74C3C,
+        ping: bool = False,
+    ):
         log.warning("[%s] %s: %s", guild.name, title, description)
         chan = await self.log_channel(guild)
         if chan is None:
             return
-        embed = discord.Embed(title=title, description=description, color=color)
-        embed.timestamp = datetime.datetime.now(UTC)
+
+        ping_id = self.cfg.get("alert_ping_user_id") if ping else None
+        view = self.build_cv2(title, description, color, mention_id=ping_id)
+
         try:
-            await chan.send(embed=embed)
+            # content/embeds can't be combined with a Components V2 view —
+            # the mention (if any) is already inside the container as text.
+            await chan.send(view=view, allowed_mentions=discord.AllowedMentions(users=True))
         except discord.HTTPException:
             log.exception("Failed to send alert to log channel")
 
@@ -144,10 +195,12 @@ class AntiNuke(commands.Cog):
         executor once their count for `action_key` crosses the configured
         threshold inside the rolling window."""
         if executor is None:
+            severe = action_key in self.cfg.get("severe_actions", [])
             await self.alert(
                 guild,
                 f"⚠️ Unattributed {action_key}",
                 f"{detail}\nCould not resolve an executor from the audit log.",
+                ping=severe,
             )
             return
 
@@ -217,6 +270,7 @@ class AntiNuke(commands.Cog):
                 f"🚨 PUNISHED {executor} for '{reason_key}'",
                 f"Actions taken: {', '.join(actions_taken) or 'none (missing permissions — check role hierarchy)'}",
                 color=0x992D22,
+                ping=True,
             )
         finally:
             self._punishing.discard(key)
@@ -259,6 +313,7 @@ class AntiNuke(commands.Cog):
             f"🪤 Trap channel triggered: {member}",
             f"{member} ({member.id}) posted in <#{trap_id}>. Result: {outcome}.",
             color=0x992D22,
+            ping=True,
         )
 
     # ------------------------------------------------------------------ #
@@ -465,22 +520,98 @@ class AntiNuke(commands.Cog):
     async def status(self, ctx: commands.Context):
         t = self.cfg["thresholds"]
         lines = [f"**{k}**: {v}" for k, v in t.items()]
-        embed = discord.Embed(
-            title="Anti-Nuke status",
-            description="\n".join(lines),
-            color=0x2ECC71,
-        )
-        embed.add_field(
-            name="Whitelisted users", value=str(len(self.cfg.get("whitelisted_users", [])))
-        )
-        embed.add_field(
-            name="Whitelisted roles", value=str(len(self.cfg.get("whitelisted_roles", [])))
-        )
         trap_id = self.cfg.get("trap_channel_id")
-        embed.add_field(
-            name="Trap channel", value=f"<#{trap_id}>" if trap_id else "not set"
-        )
-        await ctx.reply(embed=embed)
+        lines.append("")
+        lines.append(f"**Whitelisted users**: {len(self.cfg.get('whitelisted_users', []))}")
+        lines.append(f"**Whitelisted roles**: {len(self.cfg.get('whitelisted_roles', []))}")
+        lines.append(f"**Trap channel**: {f'<#{trap_id}>' if trap_id else 'not set'}")
+        role_id = self.cfg.get("special_staff_role_id")
+        lines.append(f"**+s staff role**: {f'<@&{role_id}>' if role_id else 'not set'}")
+        view = self.build_cv2("Anti-Nuke status", "\n".join(lines), 0x2ECC71)
+        await ctx.reply(view=view)
+
+
+    # ------------------------------------------------------------------ #
+    # "+s" commands — usable only by members with special_staff_role_id
+    # ------------------------------------------------------------------ #
+
+    async def cv2_reply(self, ctx: commands.Context, title: str, description: str, color: int):
+        view = self.build_cv2(title, description, color)
+        await ctx.reply(view=view)
+
+    @commands.command(name="ban")
+    @has_special_role()
+    async def s_ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+        try:
+            await ctx.guild.ban(member, reason=f"By {ctx.author}: {reason}", delete_message_seconds=0)
+            await self.cv2_reply(ctx, "🔨 Member banned", f"{member} ({member.id}) was banned.\nReason: {reason}", 0x992D22)
+        except discord.Forbidden:
+            await self.cv2_reply(ctx, "❌ Could not ban", f"Missing permissions, or {member}'s role is above mine.", 0xE74C3C)
+
+    @commands.command(name="unban")
+    @has_special_role()
+    async def s_unban(self, ctx: commands.Context, user_id: int, *, reason: str = "No reason provided"):
+        try:
+            await ctx.guild.unban(discord.Object(id=user_id), reason=f"By {ctx.author}: {reason}")
+            await self.cv2_reply(ctx, "✅ Member unbanned", f"User ID {user_id} was unbanned.\nReason: {reason}", 0x2ECC71)
+        except discord.NotFound:
+            await self.cv2_reply(ctx, "❌ Could not unban", f"No ban found for user ID {user_id}.", 0xE74C3C)
+        except discord.Forbidden:
+            await self.cv2_reply(ctx, "❌ Could not unban", "Missing permissions.", 0xE74C3C)
+
+    @commands.command(name="kick")
+    @has_special_role()
+    async def s_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+        try:
+            await member.kick(reason=f"By {ctx.author}: {reason}")
+            await self.cv2_reply(ctx, "👢 Member kicked", f"{member} ({member.id}) was kicked.\nReason: {reason}", 0xF39C12)
+        except discord.Forbidden:
+            await self.cv2_reply(ctx, "❌ Could not kick", f"Missing permissions, or {member}'s role is above mine.", 0xE74C3C)
+
+    @commands.command(name="mute")
+    @has_special_role()
+    async def s_mute(self, ctx: commands.Context, member: discord.Member, minutes: int = 60, *, reason: str = "No reason provided"):
+        try:
+            until = datetime.datetime.now(UTC) + datetime.timedelta(minutes=minutes)
+            await member.timeout(until, reason=f"By {ctx.author}: {reason}")
+            await self.cv2_reply(ctx, "🔇 Member muted", f"{member} ({member.id}) timed out for {minutes}m.\nReason: {reason}", 0xF39C12)
+        except discord.Forbidden:
+            await self.cv2_reply(ctx, "❌ Could not mute", f"Missing permissions, or {member}'s role is above mine.", 0xE74C3C)
+
+    @commands.command(name="unmute")
+    @has_special_role()
+    async def s_unmute(self, ctx: commands.Context, member: discord.Member):
+        try:
+            await member.timeout(None, reason=f"By {ctx.author}")
+            await self.cv2_reply(ctx, "🔊 Member unmuted", f"{member} ({member.id}) is no longer timed out.", 0x2ECC71)
+        except discord.Forbidden:
+            await self.cv2_reply(ctx, "❌ Could not unmute", f"Missing permissions, or {member}'s role is above mine.", 0xE74C3C)
+
+    @commands.command(name="clear")
+    @has_special_role()
+    async def s_clear(self, ctx: commands.Context, amount: int = 10):
+        amount = max(1, min(amount, 100))
+        try:
+            deleted = await ctx.channel.purge(limit=amount + 1)  # +1 to also remove the command message
+            await self.cv2_reply(ctx, "🧹 Messages cleared", f"Deleted {len(deleted) - 1} message(s) in {ctx.channel.mention}.", 0x2ECC71)
+        except discord.Forbidden:
+            await self.cv2_reply(ctx, "❌ Could not clear", "Missing 'Manage Messages' permission in this channel.", 0xE74C3C)
+
+    @s_ban.error
+    @s_unban.error
+    @s_kick.error
+    @s_mute.error
+    @s_unmute.error
+    @s_clear.error
+    async def special_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.CheckFailure):
+            return  # silently ignore — don't reveal the command exists to non-staff
+        if isinstance(error, commands.MemberNotFound):
+            return await self.cv2_reply(ctx, "❌ Member not found", str(error), 0xE74C3C)
+        if isinstance(error, commands.MissingRequiredArgument):
+            return await self.cv2_reply(ctx, "❌ Missing argument", str(error), 0xE74C3C)
+        log.exception("Unhandled error in +s command", exc_info=error)
+        await self.cv2_reply(ctx, "❌ Unexpected error", str(error), 0xE74C3C)
 
 
 async def setup(bot: commands.Bot):
