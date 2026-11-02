@@ -222,6 +222,46 @@ class AntiNuke(commands.Cog):
             self._punishing.discard(key)
 
     # ------------------------------------------------------------------ #
+    # Listener: "piège à rats" honeypot channel
+    #
+    # A channel no legitimate member should ever post in (not linked
+    # anywhere, or only visible via a fake "free nitro" style lure like
+    # scam bots post). Anyone who sends a message there gets banned
+    # instantly — no threshold, one message is enough.
+    # ------------------------------------------------------------------ #
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or message.guild is None:
+            return
+
+        trap_id = self.cfg.get("trap_channel_id")
+        if not trap_id or message.channel.id != trap_id:
+            return
+
+        member = message.author
+        if self.is_whitelisted(message.guild, member):
+            return  # so admins testing the channel don't ban themselves
+
+        reason = "Anti-raid: posted in the honeypot/trap channel"
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        try:
+            await message.guild.ban(member, reason=reason, delete_message_seconds=86400)
+            outcome = "banned, last 24h of their messages purged"
+        except discord.Forbidden:
+            outcome = "COULD NOT BAN (missing permissions / role hierarchy)"
+
+        await self.alert(
+            message.guild,
+            f"🪤 Trap channel triggered: {member}",
+            f"{member} ({member.id}) posted in <#{trap_id}>. Result: {outcome}.",
+            color=0x992D22,
+        )
+
+    # ------------------------------------------------------------------ #
     # Listeners: members joining / leaving
     # ------------------------------------------------------------------ #
 
@@ -408,6 +448,19 @@ class AntiNuke(commands.Cog):
         self.bot.save_config()
         await ctx.reply(f"✅ Log channel set to {channel.mention}.")
 
+    @commands.command(name="an_set_trap_channel")
+    async def set_trap_channel(self, ctx: commands.Context, channel: discord.TextChannel):
+        if not self._is_authorized(ctx):
+            return await ctx.reply("You are not authorized to change anti-nuke settings.")
+        self.cfg["trap_channel_id"] = channel.id
+        self.bot.save_config()
+        await ctx.reply(
+            f"🪤 Trap channel set to {channel.mention} — anyone who posts there now gets "
+            "banned instantly. Make sure it's hidden from everyone except "
+            "@everyone/scam-bait visibility, and that none of your real mods/admins "
+            "would ever post in it (whitelisted users are exempt)."
+        )
+
     @commands.command(name="an_status")
     async def status(self, ctx: commands.Context):
         t = self.cfg["thresholds"]
@@ -422,6 +475,10 @@ class AntiNuke(commands.Cog):
         )
         embed.add_field(
             name="Whitelisted roles", value=str(len(self.cfg.get("whitelisted_roles", [])))
+        )
+        trap_id = self.cfg.get("trap_channel_id")
+        embed.add_field(
+            name="Trap channel", value=f"<#{trap_id}>" if trap_id else "not set"
         )
         await ctx.reply(embed=embed)
 
