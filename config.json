@@ -1,0 +1,51 @@
+{
+  "_comment": "Non-secret settings only. The bot token is never stored here — it is read from the DISCORD_TOKEN environment variable (see .env.example / README).",
+  "log_channel_id": 0,
+  "owner_ids": [],
+  "whitelisted_users": [],
+  "whitelisted_roles": [],
+
+  "new_account_min_age_days": 7,
+  "new_account_action": "kick",
+
+  "punishment": {
+    "strip_roles": true,
+    "timeout_minutes": 10080,
+    "ban_on_severe": true
+  },
+
+  "thresholds": {
+    "window_seconds": 10,
+    "kicks": 3,
+    "bans": 3,
+    "mutes": 5,
+    "dangerous_role_grants": 2,
+    "channel_deletes": 2,
+    "channel_creates": 5,
+    "role_deletes": 2,
+    "role_creates": 5,
+    "bot_adds": 1,
+    "webhook_creates": 3
+  },
+
+  "dangerous_permissions": [
+    "administrator",
+    "ban_members",
+    "kick_members",
+    "manage_guild",
+    "manage_roles",
+    "manage_channels",
+    "manage_webhooks",
+    "mention_everyone",
+    "manage_messages",
+    "moderate_members"
+  ],
+
+  "severe_actions": [
+    "bot_adds",
+    "bans",
+    "kicks",
+    "channel_deletes",
+    "role_deletes"
+  ]
+}
