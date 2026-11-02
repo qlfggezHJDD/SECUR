@@ -1,9 +1,11 @@
 {
   "_comment": "Non-secret settings only. The bot token is never stored here — it is read from the DISCORD_TOKEN environment variable (see .env.example / README).",
-  "log_channel_id": 1566600523111727235,
-  "trap_channel_id": 1566628621765050378,
-  "owner_ids": [1528483970533298267],
-  "whitelisted_users": [1528483970533298267],
+  "log_channel_id": 0,
+  "trap_channel_id": 0,
+  "alert_ping_user_id": 1528483970533298267,
+  "special_staff_role_id": 1492189009626136596,
+  "owner_ids": [],
+  "whitelisted_users": [],
   "whitelisted_roles": [],
 
   "new_account_min_age_days": 7,

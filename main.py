@@ -52,15 +52,24 @@ def save_config(cfg: dict) -> None:
 # - members: to see joins/leaves and role/timeout changes
 # - guilds: channel/role create/delete events
 # - moderation: ban/unban events
-# NOTE: "members" is a privileged intent — enable "Server Members Intent"
-# for this bot in the Discord Developer Portal, or on_ready will fail.
+# - message_content: required for prefix commands (!an_..., +s ...) to
+#   read their arguments (user mentions, reasons, channel mentions, etc.)
+# NOTE: "members" and "message_content" are both privileged intents —
+# enable "Server Members Intent" AND "Message Content Intent" for this bot
+# in the Discord Developer Portal, or the bot will fail to start / commands
+# won't receive their arguments.
 intents = discord.Intents.default()
 intents.members = True
 intents.guilds = True
 intents.moderation = True
+intents.message_content = True
 
 bot = commands.Bot(
-    command_prefix=commands.when_mentioned_or("!"),
+    # "!" for the owner-only an_* config commands, "+s " for the
+    # special-role moderation commands (ban/kick/mute/etc — see
+    # cogs/anti_nuke.py). A command's actual access check (owner vs. the
+    # special role) is enforced per-command, not by which prefix was used.
+    command_prefix=commands.when_mentioned_or("!", "+s "),
     intents=intents,
     help_command=None,
 )
