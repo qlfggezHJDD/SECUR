@@ -1,6 +1,7 @@
 {
   "_comment": "Non-secret settings only. The bot token is never stored here — it is read from the DISCORD_TOKEN environment variable (see .env.example / README).",
   "log_channel_id": 0,
+  "trap_channel_id": 0,
   "owner_ids": [],
   "whitelisted_users": [],
   "whitelisted_roles": [],

@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: anti-nuke-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false # set the real value in the Render dashboard, not here
+    healthCheckPath: /health
+    autoDeploy: true
